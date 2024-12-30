@@ -2,12 +2,13 @@ import streamlit as st
 import geopandas as gpd
 import pandas as pd
 import osmnx as ox
-import pydeck as pdk
 import folium
+from streamlit_folium import st_folium
+from shapely import wkt
 from shapely.geometry import Point
 import shapely.geometry as sg
-from streamlit_folium import st_folium
 import time
+from folium.plugins import HeatMap
 
 # --- PAGE SETUP ---
 st.set_page_config(
@@ -17,29 +18,30 @@ st.set_page_config(
 )
 
 st.title("🌍 Walkability Map App")
-st.caption("Explore urban walkability with dynamic heatmaps.")
+st.caption("Explore urban walkability with dynamic heatmaps and interactive maps.")
 
 
 # --- SIDEBAR INTERFACE ---
-st.sidebar.header("Location Selection")
+st.sidebar.header("Location and Filter Settings")
+
+# --- LOCATION INPUT ---
+st.sidebar.subheader("Select a Location")
 location_method = st.sidebar.radio(
-    "How would you like to select the location?",
+    "Choose how to set the location:",
     ["Text Input", "Map Click"],
     key="location_method_selector"
 )
 
-# Default Variables
+# Default location for the map
+default_location = [37.7749, -122.4194]  # San Francisco, CA
 Boundary = None
-default_address = "San Francisco, CA"
 
 
 # --- LOCATION SELECTION ---
-
-# TEXT INPUT METHOD
 if location_method == "Text Input":
     address = st.sidebar.text_input(
         "Enter a location:",
-        value=default_address,
+        value="San Francisco, CA",
         help="Enter a city, neighborhood, or address.",
         key="location_text_input"
     )
@@ -51,68 +53,14 @@ if location_method == "Text Input":
     except Exception as e:
         st.sidebar.warning("Failed to geocode the address. Try refining your input.")
         st.sidebar.write(f"Error: {e}")
+        Boundary = sg.Point(default_location[1], default_location[0]).buffer(0.01)
 
-# MAP CLICK METHOD
 else:
-    st.sidebar.write("Click on the map to select a location.")
-
-    # Default map location and zoom
-    default_location = [37.7749, -122.4194]  # San Francisco, CA
-    map_center = default_location
-
-    # Create a Folium map
-    m = folium.Map(location=map_center, zoom_start=12)
-
-    # Add a clickable map
-    folium.Marker(location=map_center, popup="Default Location").add_to(m)
-    map_click = st_folium(
-        m,
-        width=700,
-        height=500,
-        key="map_click_selector"
-    )
-
-    # Extract clicked coordinates
-    clicked_point = map_click.get("last_clicked")
-    if clicked_point:
-        lat = clicked_point["lat"]
-        lon = clicked_point["lng"]
-        st.sidebar.success(f"Coordinates selected: ({lat}, {lon})")
-        
-        try:
-            with st.spinner("Finding the administrative boundary for your coordinates..."):
-                # Fetch administrative boundaries
-                point = (lat, lon)
-                Perimeter = ox.features_from_point(
-                    point, tags={"boundary": "administrative"}
-                )
-                if not Perimeter.empty:
-                    # Merge multiple geometries if necessary
-                    Boundary = Perimeter.geometry.unary_union
-                    st.sidebar.success(f"Boundary found for clicked point: ({lat}, {lon})")
-                else:
-                    # Fallback: Create a buffer around the point
-                    Boundary = sg.Point(lon, lat).buffer(0.01)  # ~1km radius
-                    st.sidebar.warning(
-                        "No administrative boundary found. Using a circular buffer (~1km) instead."
-                    )
-        except Exception as e:
-            st.sidebar.warning("Failed to find an administrative boundary.")
-            st.sidebar.write(f"Error: {e}")
-            Boundary = sg.Point(lon, lat).buffer(0.01)  # Fallback buffer
-    else:
-        st.sidebar.info("Click on the map to select a location.")
-
-# Ensure Boundary is defined
-if Boundary is None:
-    st.stop()
-
-# Convert Boundary to WKT for caching compatibility
-boundary_wkt = Boundary.wkt
+    st.sidebar.write("Click on the map to set a location.")
 
 
-# --- AMENITY CATEGORIES ---
-st.sidebar.header("Amenity Filters")
+# --- AMENITY FILTERS ---
+st.sidebar.subheader("Amenity Filters")
 amenity_categories = {
     "Entertainment": {"amenity": ["arts_centre", "cinema", "nightclub", "theatre"]},
     "Civic": {"amenity": ["courthouse", "fire_station", "post_office"]},
@@ -127,17 +75,15 @@ selected_categories = st.sidebar.multiselect(
     default=["FB (Food & Beverage)"]
 )
 
-# SPECIFIC AMENITY FILTER
-st.sidebar.header("Specific Amenity Filter")
+# Specific amenity selection
+st.sidebar.subheader("Specific Amenity Filter")
 specific_amenity = st.sidebar.selectbox(
     "Choose a specific amenity:",
     options=["Transit Stations", "Libraries", "Restaurants"]
 )
 
 
-# --- FETCH DATA ---
-from shapely import wkt  # Correct import for WKT
-
+# --- FETCH AMENITY DATA ---
 @st.cache_data
 def fetch_amenities(boundary_wkt: str, tags: dict):
     """
@@ -151,74 +97,78 @@ def fetch_amenities(boundary_wkt: str, tags: dict):
         return gpd.GeoDataFrame()
 
 
-
-# Load selected categories
+# Prepare map data
 filtered_amenities = []
-for category in selected_categories:
-    tags = amenity_categories[category]
-    amenities = fetch_amenities(boundary_wkt, tags)
-    if not amenities.empty:
-        amenities['category'] = category
-        filtered_amenities.append(amenities)
+if Boundary is not None:
+    boundary_wkt = Boundary.wkt
+    
+    # Fetch amenities from categories
+    for category in selected_categories:
+        tags = amenity_categories[category]
+        amenities = fetch_amenities(boundary_wkt, tags)
+        if not amenities.empty:
+            amenities['category'] = category
+            filtered_amenities.append(amenities)
 
-# Add specific amenity filter
-if specific_amenity == "Transit Stations":
-    tags = {"amenity": "bus_station"}
-elif specific_amenity == "Libraries":
-    tags = {"amenity": "library"}
-elif specific_amenity == "Restaurants":
-    tags = {"amenity": "restaurant"}
+    # Fetch specific amenities
+    if specific_amenity == "Transit Stations":
+        tags = {"amenity": "bus_station"}
+    elif specific_amenity == "Libraries":
+        tags = {"amenity": "library"}
+    elif specific_amenity == "Restaurants":
+        tags = {"amenity": "restaurant"}
+    
+    specific_data = fetch_amenities(boundary_wkt, tags)
+    if not specific_data.empty:
+        specific_data['category'] = specific_amenity
+        filtered_amenities.append(specific_data)
 
-specific_data = fetch_amenities(boundary_wkt, tags)
-if not specific_data.empty:
-    specific_data['category'] = specific_amenity
-    filtered_amenities.append(specific_data)
+    # Merge all amenities
+    if filtered_amenities:
+        all_amenities = pd.concat(filtered_amenities, ignore_index=True)
+        all_amenities["x"] = all_amenities.geometry.centroid.x
+        all_amenities["y"] = all_amenities.geometry.centroid.y
+    else:
+        all_amenities = pd.DataFrame(columns=["x", "y"])
 
-# --- MERGE AND VALIDATE AMENITY DATA ---
+# --- INTERACTIVE MAP WITH HEATMAP ---
+st.subheader("Interactive Map with Heatmap and Clickable Selection")
 
-if filtered_amenities:
-    # Combine all amenities data into one DataFrame
-    all_amenities = pd.concat(filtered_amenities, ignore_index=True)
-    all_amenities["x"] = all_amenities.geometry.centroid.x
-    all_amenities["y"] = all_amenities.geometry.centroid.y
-else:
-    # Fallback to an empty DataFrame if no amenities are found
-    st.warning("No amenities found for selected filters. Displaying an empty map.")
-    all_amenities = pd.DataFrame(columns=["x", "y"])
+# Create the base map
+m = folium.Map(location=default_location, zoom_start=13)
 
+# Add heatmap layer if data exists
+if not all_amenities.empty:
+    HeatMap(min_opacity=0.1,
+        data=all_amenities[['y', 'x']].values.tolist(),
+        radius=15,
+        blur=5,
+        max_zoom=1,
+    ).add_to(m)
 
-# --- HEATMAP VISUALIZATION ---
-st.header("Heatmap Visualization")
-
-COLOR_SCALE = [
-    [255, 255, 204],
-    [161, 218, 180],
-    [65, 182, 196],
-    [44, 127, 184],
-    [37, 52, 148]
-]
-
-chart_data = all_amenities[['x', 'y']]
-
-Heatmap = pdk.Layer(
-    "HeatmapLayer",
-    data=chart_data,
-    opacity=0.6,
-    get_position='[x, y]',
-    color_range=COLOR_SCALE,
-    threshold=0.2,
+# Capture map clicks
+map_click = st_folium(
+    m,
+    width=800,
+    height=600,
+    key="folium_map_click"
 )
 
-view_state = pdk.ViewState(
-    longitude=chart_data['x'].mean(),
-    latitude=chart_data['y'].mean(),
-    zoom=13
-)
+# Handle map click
+clicked_point = map_click.get("last_clicked")
+if clicked_point:
+    lat = clicked_point["lat"]
+    lon = clicked_point["lng"]
+    st.sidebar.success(f"Clicked Coordinates: ({lat}, {lon})")
+    Boundary = sg.Point(lon, lat).buffer(0.01)  # Fallback circular buffer
 
-st.pydeck_chart(pdk.Deck(
-    layers=[Heatmap],
-    initial_view_state=view_state,
-    tooltip={"text": "Heatmap of Selected Amenities"}
-))
+    folium.Marker(
+        location=[lat, lon],
+        popup="Selected Point",
+        icon=folium.Icon(color="blue", icon="info-sign")
+    ).add_to(m)
 
-st.success("Visualization Complete! Explore your heatmap above.")
+# Display the map
+st_folium(m, width=800, height=600, key="main_map_display")
+
+st.success("Interactive Map Ready! Click on the map or adjust filters to explore.")
